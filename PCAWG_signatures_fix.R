@@ -31,37 +31,18 @@ out_prefix <- args[5]
 #n_boot <- 200
 if (!dir.exists(out_prefix)) dir.create(out_prefix, recursive = TRUE)
 setwd(out_prefix)
-
+SBS_ACTIVE_THRESH <- 0.05
+MNV_ACTIVE_THRESH <- 0.05
 
 message("ID = ", id)
 obj <- readRDS(obj_rds)
 vcf <- obj$vcf
 mt  <- as.data.frame(obj$mt_V) # ( “clonal [early]”, “clonal [late]”, “clonal”, “subclonal”）
 
-
-get_alt_width <- function(vcf) {
-  a <- alt(vcf)
-  # Normal Condition: DNAStringSetList
-  if (inherits(a, "DNAStringSetList")) {
-    return(S4Vectors::elementNROWS(a))
-  }
-  # Sometimes, readVcfAsVRanges may directly return DNAStringSet.
-  if (inherits(a, "DNAStringSet")) {
-    return(rep(1, length(a)))
-  }
-  # If the extreme case is DNAString (single ALT)
-  if (inherits(a, "DNAString")) {
-    return(rep(1, length(vcf)))
-  }
-  stop("Unexpected ALT type: ", class(a))
-}
-
-refW <- Biostrings::width(VariantAnnotation::ref(vcf))
-altW <- get_alt_width(vcf)
-idx_snv <- refW == 1 & altW == 1
-idx_id  <- (refW != altW)
+idx_snv <- isSNV(vcf)     # 单碱基替换
+idx_id  <- isIndel(vcf)   # 所有 indel（插入 + 缺失）
 vcf_snv_mnv <- vcf[idx_snv]
-vcf_indel  <- vcf[idx_id]
+vcf_indel   <- vcf[idx_id]
 
 cls <- as.character(mt$CLS)
 
@@ -514,63 +495,152 @@ getSignatureWeights <- function(mutationMatrix, active_comp, sig_comp, sigs){
 
 
 extractSigs <- function(events){
-
-  # start with SNV signatures
-  active_sigs = colnames(snv_comp)
-  active_comp = as.matrix(snv_comp[,active_sigs])
-  events_snv = lapply(events, function(x){
-    x = x[names(x) %in% rownames(snv_comp)]
-    if (length(names(x))!=96){
-      missing = rownames(snv_comp)[!rownames(snv_comp) %in% names(x)]
-      add = rep(0, length(missing))
-      names(add) = missing
-      x = c(x, add)
-      x = x[rownames(snv_comp)]
+  
+  ## ========= 0. 先用“所有时间层合在一起”的 multinomial 推断该样本的 active_sbs / active_mnv =========
+  ## ---- SNV: 合并所有 timing 的 96-context 计数 ----
+  total_snv_vec <- rep(0, nrow(snv_comp))
+  names(total_snv_vec) <- rownames(snv_comp)
+  
+  for (x in events) {
+    v <- x[names(x) %in% rownames(snv_comp)]
+    if (length(v) > 0) {
+      total_snv_vec[names(v)] <- total_snv_vec[names(v)] + as.numeric(v)
     }
-    x = x[rownames(snv_comp)]
-    return(x)
-  })
-  weightsList = lapply(events_snv, getSignatureWeights, active_comp=active_comp, sig_comp=snv_comp, sigs=active_sigs)
-  weights_snv = do.call("rbind", weightsList)
-  
-  # MNV signatures
-    active_mnv = colnames(mnv_comp)
-    active_mnv_comp =  as.matrix(mnv_comp[,active_mnv])
-    events_mnv = lapply(events, function(x){
-      x = x[names(x) %in% rownames(mnv_comp)]
-      if (length(names(x))!=78){
-        missing = rownames(mnv_comp)[!rownames(mnv_comp) %in% names(x)]
-        add = rep(0, length(missing))
-        names(add) = missing
-        x = c(x, add)
-        x = x[rownames(mnv_comp)]
-      } 
-      x = x[rownames(mnv_comp)]
-      return(x)
-    })
-    weightsList_MNV = lapply(events_mnv, getSignatureWeights,active=active_mnv_comp,sig_comp=mnv_comp,sig=active_mnv)
-    weights_mnv = do.call("rbind", weightsList_MNV)
-  
-  # ID signatures
-  events_id = lapply(events, function(x){
-    x = x[grep("ID", names(x))]
-    indel_sigs = c("ID1", "ID2", "ID13", "ID8")
-    missing = indel_sigs[which(!indel_sigs %in% names(x))]
-    add = rep(0, length(missing))
-    names(add) = missing
-    x = c(x, add)
-    x = x[indel_sigs]
-  })
-  events_id = do.call("rbind", events_id)
-  if(ncol(events_id)!=4){
-    add = data.frame(matrix(0, nrow=nrow(events_id), ncol=length(missing)))
-    colnames(add) = missing
-    events_id = cbind(events_id, add)
   }
   
-  # Combine signature results
-  all_weights = cbind(weights_snv[,1:ncol(weights_snv)-1],weights_mnv[,1:ncol(weights_mnv)-1], events_id)
-  all_weights$sample = id
+  snv_mat <- matrix(total_snv_vec, ncol = 1)
+  rownames(snv_mat) <- rownames(snv_comp)
+  colnames(snv_mat) <- "total"
+  
+  # 用全部签名拟合一次，得到“整体暴露”
+  full_snv_weights <- getSignatureWeights(
+    mutationMatrix = snv_mat,
+    active_comp    = as.matrix(snv_comp),  # 这里先不筛选
+    sig_comp       = snv_comp,
+    sigs           = colnames(snv_comp)
+  )
+  
+  w_vec_sbs <- as.numeric(full_snv_weights[1, colnames(snv_comp), drop = TRUE])
+  names(w_vec_sbs) <- colnames(snv_comp)
+  if (sum(w_vec_sbs, na.rm = TRUE) > 0) {
+    w_vec_sbs <- w_vec_sbs / sum(w_vec_sbs, na.rm = TRUE)
+  }
+  active_sbs <- names(w_vec_sbs)[w_vec_sbs >= SBS_ACTIVE_THRESH]
+  if (length(active_sbs) == 0) {
+    # 万一阈值太严格导致一个都没有，就退回到全部
+    active_sbs <- names(w_vec_sbs)
+  }
+  
+  ## ---- MNV (DBS): 同理，合并所有 DBS 计数 ----
+  total_mnv_vec <- rep(0, nrow(mnv_comp))
+  names(total_mnv_vec) <- rownames(mnv_comp)
+  
+  for (x in events) {
+    v <- x[names(x) %in% rownames(mnv_comp)]
+    if (length(v) > 0) {
+      total_mnv_vec[names(v)] <- total_mnv_vec[names(v)] + as.numeric(v)
+    }
+  }
+  
+  mnv_mat <- matrix(total_mnv_vec, ncol = 1)
+  rownames(mnv_mat) <- rownames(mnv_comp)
+  colnames(mnv_mat) <- "total"
+  
+  full_mnv_weights <- getSignatureWeights(
+    mutationMatrix = mnv_mat,
+    active_comp    = as.matrix(mnv_comp),
+    sig_comp       = mnv_comp,
+    sigs           = colnames(mnv_comp)
+  )
+  
+  w_vec_mnv <- as.numeric(full_mnv_weights[1, colnames(mnv_comp), drop = TRUE])
+  names(w_vec_mnv) <- colnames(mnv_comp)
+  if (sum(w_vec_mnv, na.rm = TRUE) > 0) {
+    w_vec_mnv <- w_vec_mnv / sum(w_vec_mnv, na.rm = TRUE)
+  }
+  active_mnv <- names(w_vec_mnv)[w_vec_mnv >= MNV_ACTIVE_THRESH]
+  if (length(active_mnv) == 0) {
+    active_mnv <- names(w_vec_mnv)
+  }
+  
+  ## ========= 1. 用“筛完的 active_sbs/active_mnv” 正式拟合各个 time layer =========
+  ## ---- SNV signatures: 96-context → 按 active_sbs NNLS ----
+  active_sbs_comp <- as.matrix(snv_comp[, active_sbs, drop = FALSE])
+  
+  events_snv <- lapply(events, function(x){
+    x <- x[names(x) %in% rownames(snv_comp)]
+    if (length(names(x)) != 96) {
+      missing <- rownames(snv_comp)[!rownames(snv_comp) %in% names(x)]
+      add <- rep(0, length(missing))
+      names(add) <- missing
+      x <- c(x, add)
+      x <- x[rownames(snv_comp)]
+    } else {
+      x <- x[rownames(snv_comp)]
+    }
+    x
+  })
+  
+  weightsList_snv <- lapply(
+    events_snv,
+    getSignatureWeights,
+    active_comp = active_sbs_comp,
+    sig_comp    = snv_comp,
+    sigs        = active_sbs
+  )
+  weights_snv <- do.call("rbind", weightsList_snv)
+  
+  ## ---- MNV signatures: DBS → 按 active_mnv NNLS ----
+  active_mnv_comp <- as.matrix(mnv_comp[, active_mnv, drop = FALSE])
+  
+  events_mnv <- lapply(events, function(x){
+    x <- x[names(x) %in% rownames(mnv_comp)]
+    if (length(names(x)) != nrow(mnv_comp)) {
+      missing <- rownames(mnv_comp)[!rownames(mnv_comp) %in% names(x)]
+      add <- rep(0, length(missing))
+      names(add) <- missing
+      x <- c(x, add)
+      x <- x[rownames(mnv_comp)]
+    } else {
+      x <- x[rownames(mnv_comp)]
+    }
+    x
+  })
+  
+  weightsList_mnv <- lapply(
+    events_mnv,
+    getSignatureWeights,
+    active_comp = active_mnv_comp,
+    sig_comp    = mnv_comp,
+    sigs        = active_mnv
+  )
+  weights_mnv <- do.call("rbind", weightsList_mnv)
+  
+  ## ---- ID signatures: 还是照原来 ID1/2/13/8 全部保留 ----
+  events_id <- lapply(events, function(x){
+    x <- x[grep("ID", names(x))]
+    indel_sigs <- c("ID1", "ID2", "ID13", "ID8")
+    missing <- indel_sigs[which(!indel_sigs %in% names(x))]
+    add <- rep(0, length(missing))
+    names(add) <- missing
+    x <- c(x, add)
+    x[indel_sigs]
+  })
+  events_id <- do.call("rbind", events_id)
+  if (ncol(events_id) != 4) {
+    add <- data.frame(matrix(0, nrow = nrow(events_id), ncol = length(missing)))
+    colnames(add) <- missing
+    events_id <- cbind(events_id, add)
+  }
+  
+  ## ---- 合并 SNV + MNV + ID 的权重矩阵 ----
+  all_weights <- cbind(
+    weights_snv[, 1:(ncol(weights_snv) - 1), drop = FALSE],
+    weights_mnv[, 1:(ncol(weights_mnv) - 1), drop = FALSE],
+    events_id
+  )
+  all_weights$sample <- id
+  
   return(all_weights)
 }
 
@@ -1045,24 +1115,39 @@ p_cs <- plot_96_pair_counts(
 
 ## ========= Help function: Extract the maximum positive/negative change, and obtain the percentage before/after. =========
 get_top_changes_with_props <- function(df, change_col, before_col, after_col) {
+  
   stopifnot(all(c(change_col, before_col, after_col) %in% colnames(df)))
+  
+  # ---- SBS signature ----
+  df <- df[grepl("^SBS", df$signature), , drop = FALSE]
+  
+  if (nrow(df) == 0) {
+    return(NULL)
+  }
+  
   d <- df[, c("signature", change_col, before_col, after_col)]
   d <- d[stats::complete.cases(d), , drop = FALSE]
+  
   if (nrow(d) == 0) return(NULL)
+  
   pos <- d[which.max(d[[change_col]]), , drop = FALSE]
   neg <- d[which.min(d[[change_col]]), , drop = FALSE]
+  
   list(
-    pos = list(sig = pos$signature,
-               change = as.numeric(pos[[change_col]]),
-               before = as.numeric(pos[[before_col]]),
-               after  = as.numeric(pos[[after_col]])),
-    neg = list(sig = neg$signature,
-               change = as.numeric(neg[[change_col]]),
-               before = as.numeric(neg[[before_col]]),
-               after  = as.numeric(neg[[after_col]]))
+    pos = list(
+      sig    = pos$signature,
+      change = as.numeric(pos[[change_col]]),
+      before = as.numeric(pos[[before_col]]),
+      after  = as.numeric(pos[[after_col]])
+    ),
+    neg = list(
+      sig    = neg$signature,
+      change = as.numeric(neg[[change_col]]),
+      before = as.numeric(neg[[before_col]]),
+      after  = as.numeric(neg[[after_col]])
+    )
   )
 }
-
 ## ========= Data required for generating geom_text (including percentage from front to back and ×FC) =========
 make_ann_with_props <- function(top_list, panel_name, x = 6, y = Inf) {
   if (is.null(top_list)) return(NULL)
