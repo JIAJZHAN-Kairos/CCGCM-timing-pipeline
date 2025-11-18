@@ -39,8 +39,8 @@ obj <- readRDS(obj_rds)
 vcf <- obj$vcf
 mt  <- as.data.frame(obj$mt_V) # ( “clonal [early]”, “clonal [late]”, “clonal”, “subclonal”）
 
-idx_snv <- isSNV(vcf)     # 单碱基替换
-idx_id  <- isIndel(vcf)   # 所有 indel（插入 + 缺失）
+idx_snv <- isSNV(vcf)     # sbs/mnv
+idx_id  <- isIndel(vcf)   # indel
 vcf_snv_mnv <- vcf[idx_snv]
 vcf_indel   <- vcf[idx_id]
 
