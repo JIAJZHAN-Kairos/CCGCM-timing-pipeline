@@ -496,8 +496,6 @@ getSignatureWeights <- function(mutationMatrix, active_comp, sig_comp, sigs){
 
 extractSigs <- function(events){
   
-  ## ========= 0. 先用“所有时间层合在一起”的 multinomial 推断该样本的 active_sbs / active_mnv =========
-  ## ---- SNV: 合并所有 timing 的 96-context 计数 ----
   total_snv_vec <- rep(0, nrow(snv_comp))
   names(total_snv_vec) <- rownames(snv_comp)
   
@@ -512,7 +510,7 @@ extractSigs <- function(events){
   rownames(snv_mat) <- rownames(snv_comp)
   colnames(snv_mat) <- "total"
   
-  # 用全部签名拟合一次，得到“整体暴露”
+  # Fit all signatures once to obtain "Overall Exposure"
   full_snv_weights <- getSignatureWeights(
     mutationMatrix = snv_mat,
     active_comp    = as.matrix(snv_comp),  # 这里先不筛选
@@ -527,11 +525,11 @@ extractSigs <- function(events){
   }
   active_sbs <- names(w_vec_sbs)[w_vec_sbs >= SBS_ACTIVE_THRESH]
   if (length(active_sbs) == 0) {
-    # 万一阈值太严格导致一个都没有，就退回到全部
+    # In case the threshold is too strict and results in none at all, revert to all.
     active_sbs <- names(w_vec_sbs)
   }
   
-  ## ---- MNV (DBS): 同理，合并所有 DBS 计数 ----
+  ## ---- MNV (DBS): Similarly, merge all DBS counts ----
   total_mnv_vec <- rep(0, nrow(mnv_comp))
   names(total_mnv_vec) <- rownames(mnv_comp)
   
@@ -563,7 +561,7 @@ extractSigs <- function(events){
     active_mnv <- names(w_vec_mnv)
   }
   
-  ## ========= 1. 用“筛完的 active_sbs/active_mnv” 正式拟合各个 time layer =========
+  ## ========= 1. Fit each time layer using the "screened active_sbs/active_mnv" data =========
   ## ---- SNV signatures: 96-context → 按 active_sbs NNLS ----
   active_sbs_comp <- as.matrix(snv_comp[, active_sbs, drop = FALSE])
   
@@ -590,7 +588,7 @@ extractSigs <- function(events){
   )
   weights_snv <- do.call("rbind", weightsList_snv)
   
-  ## ---- MNV signatures: DBS → 按 active_mnv NNLS ----
+  ## ---- MNV signatures ----
   active_mnv_comp <- as.matrix(mnv_comp[, active_mnv, drop = FALSE])
   
   events_mnv <- lapply(events, function(x){
@@ -616,7 +614,7 @@ extractSigs <- function(events){
   )
   weights_mnv <- do.call("rbind", weightsList_mnv)
   
-  ## ---- ID signatures: 还是照原来 ID1/2/13/8 全部保留 ----
+  ## ---- ID signatures ----
   events_id <- lapply(events, function(x){
     x <- x[grep("ID", names(x))]
     indel_sigs <- c("ID1", "ID2", "ID13", "ID8")
@@ -633,7 +631,7 @@ extractSigs <- function(events){
     events_id <- cbind(events_id, add)
   }
   
-  ## ---- 合并 SNV + MNV + ID 的权重矩阵 ----
+  ## ---- merge ----
   all_weights <- cbind(
     weights_snv[, 1:(ncol(weights_snv) - 1), drop = FALSE],
     weights_mnv[, 1:(ncol(weights_mnv) - 1), drop = FALSE],
